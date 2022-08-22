@@ -104,6 +104,18 @@
 		(-map 'car full-opts))))
     (or (alist-get name full-opts) "")))
 
+(cl-defmethod find-file-name-by-id ((ctx bb2--ctx-basic) file-id)
+  "Retrieve the file name of FILE-ID from existing files."
+  (let ((files (--> (oref bb2-ctx files)
+		    (alist-get 'files it)
+		    (seq-into it 'list))))
+    (--> files
+	 (-find (lambda (item)
+		  (string= file-id (alist-get 'fileId item)))
+		it)
+	 (alist-get 'fileName it))))
+	   
+
 (cl-defmethod set-file-names ((ctx bb2--ctx-basic))
   (ctx-fetch
    ctx
@@ -149,12 +161,15 @@
   (fatch
    (make-url ctx 'download-file-by-id)
    (lambda ()
-     (let ((val (fatch-read-text)))
+     (let* ((val (fatch-read-text))
+	    (id (alist-get 'fileId (fatch-args :params)))
+	    (file-name (find-file-name-by-id bb2-ctx id)))
         (message "[bb2] %s %s ? %s"
       		(fatch-args :method)
       		(fatch-args :url)
       		(fatch-args :params))
-        (with-current-buffer (get-buffer-create "weef")
+        (with-current-buffer
+	    (get-buffer-create (or file-name "*bb2-recent-file*"))
 	  (erase-buffer)
 	  (goto-char (point-min))
      	  (org-mode)
@@ -214,19 +229,24 @@
   :type "GET"
   :headers (bb2--pre-auth-headers)))
 
-(defun bb2-get-org-file (file-id)
+(defun bb2-ls ()
+  "Retrieves files from the current BB2-BUCKET-ID."
+  (interactive)
+  (set-file-names bb2-ctx))
+
+(defun bb2-open-remote (file-id)
   "Download an org file from backblaze into a new buffer."
   (interactive
    (let ((file-id (ask-for-id-by-name bb2-ctx)))
      (list file-id)))
   (get-org-file-by-id bb2-down-ctx file-id))
 
-(defun bb2-set-upload-config ()
+(defun bb2-config-uploads ()
   "Fetches the configuration for uploading."
   (interactive)
   (set-upload-config bb2-ctx))
 
-(defun bb2-upload-org-buffer (buf)
+(defun bb2-save-remote (buf)
   "Upload the current org buffer BUF to backblaze. The buffer's name becomes
 the new filename, overwriting any existing backblaze objects of the same name."
   (interactive
