@@ -1,32 +1,73 @@
 ;; For syncing org files using backblaze b2.
 (require 'dash)
-(require 'fatch)
+(require 'request)
+(require 'assoak)
 
-;; Globals
-;; - key-id: id of api key
-;; - key-value: value of api key
-;; - bucket-id: selected bucket
 (defvar bb2-api-key-id ""
   "Key for the backblaze API.")
 (defvar bb2-api-key-value ""
   "Value for the backblaze API.")
 (defvar bb2-bucket-id ""
   "The current bucket.")
-(defvar bb2-response nil
-  "The current API response data.")
-(defvar bb2-ctx nil
-  "The current context for basic operations.")
-(defvar bb2-down-ctx nil
-  "The current context for download operations.")
-(defvar bb2-up-ctx nil
-  "The current context for upload operations.")
+
+(defun bb2--with-current-ctx (ctx &rest args)
+  (if (= (length args) 1)
+      (plist-get ctx (car args))
+    (dolist (pair (assoak-plist-to-alist args))
+      (setq ctx (plist-put ctx (car pair) (cdr pair))))
+    ctx))
+
+(defvar bb2--response
+  (list :data nil
+	:meta nil
+	:url ""
+	:error nil
+	:method "GET")
+  "Current response for the bb2 API.")
+
+(defmacro bb2--with-response (&rest body)
+  `(cl-function
+    (lambda (&key error-thrown &key data &allow-other-keys)
+      (bb2-response :data data
+		    :error error-thrown)
+      (if error-thrown
+	  (message "[bb2:error] %s %s %s"
+		   (bb2-response :method)
+		   (bb2-response :url)
+		   (bb2-response :error))
+	(message "[bb2:ok] %s %s"
+		 (bb2-response :method)
+		 (bb2-response :url)))
+      ,@body)))
+
+(defun bb2-response (&rest args)
+  (apply 'bb2--with-current-ctx
+	 (cons bb2--response args)))
+
+(defvar bb2--ctxs
+  (list :main nil
+	:downloads nil
+	:uploads nil)
+  "Current context instances.")
+
+(defun bb2-ctxs (&rest args)
+  (apply 'bb2--with-current-ctx
+	 (cons bb2--ctxs args)))
+
+(defvar bb2-instance nil
+  "Currently bound instance from `bb2--ctxs'.")
+
+(defmacro bb2-with-instance (ctx-prop &rest body)
+  (declare (indent defun))
+  `(let ((bb2-instance (bb2-ctxs ,ctx-prop)))
+     ,@body))
 
 ;; Auth
 ;; - url: hard coded, unique to Auth
 ;; - authenticate(): set the Basic ctx
 ;;   - sets global Basic ctx
-(defun bb2--res-get (key)
-  (alist-get key bb2-response))
+(defun bb2--data-get (key)
+  (alist-get key (bb2-response :data)))
 
 (defun bb2--pre-auth-headers ()
   `((Authorization . ,(format
@@ -53,19 +94,19 @@
 
 (cl-defmethod ctx-fetch ((ctx bb2--ctx-interface) endpoint &rest args)
   "Makes a request at ENDPOINT of the current CTX's url."
-  (fatch
-   (make-url ctx endpoint)
-   (plist-get args :complete)
-   :method (if-let ((meth (plist-get args :method)))
-	       (upcase (if (symbolp meth)
-			   (symbol-name meth)
-			 meth))
-	     "GET")
-   :data (plist-get args :data)
-   :params (plist-get args :params)
-   :headers (auth-headers ctx (plist-get args :headers))
-   :ctx (plist-get args :ctx)))
-
+  (let ((-url (make-url ctx endpoint)))
+    (bb2-response :url -url
+		  :meta (plist-get args :meta))
+    (request
+      -url
+      :type (or (plist-get args :type)
+		"GET")
+      :parser (plist-get args :parser)
+      :headers (auth-headers ctx (plist-get args :headers))
+      :params (plist-get args :params)
+      :data (plist-get args :data)
+      :complete (plist-get args :complete))))
+  
 (defun bb2--format-endpoint (endpt)
   (let ((val (if (symbolp endpt)
 		 (symbol-name endpt)
@@ -89,12 +130,13 @@
   "API context for basic operations.")
 
 (cl-defmethod full-file-options ((ctx bb2--ctx-basic))
-  (--> (oref bb2-ctx files)
-       (alist-get 'files it)
-       (-map (lambda (obj)
-	       (cons (alist-get 'fileName obj)
-		     (alist-get 'fileId obj)))
-	     it)))
+  (with-slots (files) ctx
+    (--> files
+	 (alist-get 'files it)
+	 (-map (lambda (obj)
+		 (cons (alist-get 'fileName obj)
+		       (alist-get 'fileId obj)))
+	       it))))
 
 (cl-defmethod ask-for-id-by-name ((ctx bb2--ctx-basic))
   "Interactively gets a file-id based on the selected file-name."
@@ -106,48 +148,42 @@
 
 (cl-defmethod find-file-name-by-id ((ctx bb2--ctx-basic) file-id)
   "Retrieve the file name of FILE-ID from existing files."
-  (let ((files (--> (oref bb2-ctx files)
-		    (alist-get 'files it)
-		    (seq-into it 'list))))
+  (with-slots (files) ctx
     (--> files
+	 (alist-get 'files it)
+	 (seq-into it 'list)
 	 (-find (lambda (item)
 		  (string= file-id (alist-get 'fileId item)))
 		it)
-	 (alist-get 'fileName it))))
-	   
+	 (alist-get 'fileName it))))	   
 
 (cl-defmethod set-file-names ((ctx bb2--ctx-basic))
   (ctx-fetch
    ctx
    'list-file-names
-   :method 'post
+   :meta ctx
+   :type "POST"
    :data (json-encode `((bucketId . ,bb2-bucket-id)))
-   :complete (lambda ()
-	       (let ((res (fatch-read-json)))
-		 (message "[bb2] %s %s"
-			  (fatch-args :method)
-			  (fatch-args :url))
-		 (oset (plist-get (fatch-args :ctx) :self)
-		       files
-		       res)))
-   :ctx (list :self ctx)))
+   :complete (bb2--with-response
+	      (oset (bb2-response :meta)
+		    files
+		    (bb2-response :data)))
+   :parser 'json-read))
 
 (cl-defmethod set-upload-config ((ctx bb2--ctx-basic))
   (ctx-fetch
    ctx
    'get-upload-url
-   :method 'post
+   :meta ctx
+   :type "POST"
    :data (json-encode `((bucketId . ,bb2-bucket-id)))
    :headers (auth-headers ctx)
    :ctx (list :self ctx :upload-ctx bb2-up-ctx)
-   :complete (lambda ()
-	       (let ((res (fatch-read-json))
-		     (ctx (plist-get (fatch-args :ctx) :upload-ctx)))
-		 (message "[bb2] %s %s"
-			  (fatch-args :method)
-			  (fatch-args :url))
-		 (oset ctx url (alist-get 'uploadUrl res))
-		 (oset ctx token (alist-get 'authorizationToken res))))))
+   :complete (bb2--with-response
+	      (bb2-with-instance :uploads
+		(oset bb2-instance url (bb2--data-get 'uploadUrl))
+		(oset bb2-instance token (bb2--data-get 'authorizationToken))))
+   :parser 'json-read))
 
 ;; Downloading
 ;; - token: shared w/ normal reqs
@@ -158,27 +194,24 @@
 
 (cl-defmethod get-org-file-by-id ((ctx bb2--ctx-download) file-id)
   "Fetches the org file based on FILE-ID and loads it into its own buffer."
-  (fatch
-   (make-url ctx 'download-file-by-id)
-   (lambda ()
-     (let* ((val (fatch-read-text))
-	    (id (alist-get 'fileId (fatch-args :params)))
-	    (file-name (find-file-name-by-id bb2-ctx id)))
-        (message "[bb2] %s %s ? %s"
-      		(fatch-args :method)
-      		(fatch-args :url)
-      		(fatch-args :params))
-        (with-current-buffer
-	    (get-buffer-create (or file-name "*bb2-recent-file*"))
-	  (erase-buffer)
-	  (goto-char (point-min))
-     	  (org-mode)
-      	  (insert val))))
-   :method "GET"
-   :params `((fileId . ,file-id))
-   :headers (auth-headers ctx)
-   :ctx (list :self ctx)))
-
+  (let ((params `((fileId . ,file-id)))
+	(-url (make-url ctx 'download-file-by-id)))
+    (bb2-response :meta params :url -url :method "GET")
+    (request
+     -url
+     :type "GET"
+     :params params
+     :headers (auth-headers ctx)
+     :complete (bb2--with-response
+		(let* ((val (bb2-response :data))
+		       (id (alist-get 'fileId (bb2-response :meta)))
+		       (file-name (find-file-name-by-id (bb2-ctxs :main) id)))
+		  (with-current-buffer
+		      (get-buffer-create (or file-name "*bb2-recent-file*"))
+		    (erase-buffer)
+		    (goto-char (point-min))
+     		    (org-mode)
+      		    (insert val)))))))
 ;; Uploading
 ;; - token: unique for uploading
 ;; - url: unique for uploading
@@ -191,60 +224,64 @@
   "API context for upload operations.")
 
 (cl-defmethod upload-org-file ((ctx bb2--ctx-upload) file-name contents)
-  (fatch
-   (oref ctx url)
-   (lambda ()
-     (let ((res (fatch-read-json)))
-       (message "[bb2] %s %s"
-		(fatch-args :method)
-		(fatch-args :url))
-       (pp res)))
-   :method "POST"
-   :headers (auth-headers
-	     ctx
-	     `((Content-Type . text/plain)
-	       (X-Bz-Content-Sha1 . ,(secure-hash 'sha1 contents))
-	       (X-Bz-File-Name . ,file-name)
-	       (X-Bz-Info-Author . ,(user-login-name))
-	       (X-Bz-Server-Side-Encryption . AES256)))
-   :data contents
-   :ctx (list :self ctx)))
+  (let ((-url (oref ctx url)))
+    (bb2-response :method "POST" :url -url)
+    (request
+      -url
+      :meta ctx
+      :type "POST"
+      :headers (auth-headers
+		ctx
+		`((Content-Type . text/plain)
+		  (X-Bz-Content-Sha1 . ,(secure-hash 'sha1 contents))
+		  (X-Bz-File-Name . ,file-name)
+		  (X-Bz-Info-Author . ,(user-login-name))
+		  (X-Bz-Server-Side-Encryption . AES256)))
+      :data contents
+      :complete (bb2--with-response
+		 (pp (bb2-response :data)))
+      :parser 'json-read)))
 
 ;;;; Interactions
 (defun bb2-authenticate ()
   (interactive)
-  (fatch
-   "https://api.backblazeb2.com/b2api/v2/b2_authorize_account"
-   (lambda ()
-     (let ((bb2-response (fatch-read-json)))
-       (setq bb2-ctx (bb2--ctx-basic
-		      :url (bb2--res-get 'apiUrl)
-		      :token (bb2--res-get 'authorizationToken)))
-       (setq bb2-down-ctx (bb2--ctx-download
-			   :url (bb2--res-get 'downloadUrl)
-			   :token (bb2--res-get 'authorizationToken)))
-       (setq bb2-up-ctx (bb2--ctx-upload
-			 :part-size (bb2--res-get 'recommendedPartSize)))
-       (message "[bb2] Initial authentication complete.")))
-  :type "GET"
-  :headers (bb2--pre-auth-headers)))
+  (let ((-url "https://api.backblazeb2.com/b2api/v2/b2_authorize_account"))
+    (bb2-response :method "GET"
+		  :url -url)
+    (request
+      -url 
+      :type "GET"
+      :headers (bb2--pre-auth-headers)
+      :complete (bb2--with-response
+		 (bb2-ctxs :main (bb2--ctx-basic
+				  :url (bb2--data-get 'apiUrl)
+				  :token (bb2--data-get 'authorizationToken))
+			   :downloads (bb2--ctx-download
+				       :url (bb2--data-get 'downloadUrl)
+				       :token (bb2--data-get 'authorizationToken))
+			   :uploads (bb2--ctx-upload
+				     :part-size (bb2--data-get 'recommendedPartSize))))
+      :parser 'json-read)))
 
 (defun bb2-ls ()
   "Retrieves files from the current BB2-BUCKET-ID."
   (interactive)
-  (set-file-names bb2-ctx))
+  (bb2-with-instance :main
+    (set-file-names bb2-instance)))
 
 (defun bb2-open-remote (file-id)
   "Download an org file from backblaze into a new buffer."
   (interactive
    (let ((file-id (ask-for-id-by-name bb2-ctx)))
      (list file-id)))
-  (get-org-file-by-id bb2-down-ctx file-id))
+  (bb2-with-instance :downloads
+    (get-org-file-by-id bb2-instance file-id)))
 
 (defun bb2-config-uploads ()
   "Fetches the configuration for uploading."
   (interactive)
-  (set-upload-config bb2-ctx))
+  (bb2-with-instance :main
+    (set-upload-config bb2-instance)))
 
 (defun bb2-save-remote (buf)
   "Upload the current org buffer BUF to backblaze. The buffer's name becomes
@@ -252,9 +289,10 @@ the new filename, overwriting any existing backblaze objects of the same name."
   (interactive
    (let ((buf (current-buffer)))
      (list buf)))
-  (upload-org-file bb2-up-ctx
-		   (buffer-name buf)
-		   (buffer-substring-no-properties (point-min)
-						   (point-max))))
+  (bb2-with-instance :uploads
+    (upload-org-file bb2-instance
+		     (buffer-name buf)
+		     (buffer-substring-no-properties (point-min)
+						     (point-max)))))
 
 (provide 'org-bb2)
