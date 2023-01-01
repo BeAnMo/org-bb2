@@ -178,7 +178,7 @@
    :type "POST"
    :data (json-encode `((bucketId . ,bb2-bucket-id)))
    :headers (auth-headers ctx)
-   :ctx (list :self ctx :upload-ctx bb2-up-ctx)
+   :ctx (list :self ctx)
    :complete (bb2--with-response
 	      (bb2-with-instance :uploads
 		(oset bb2-instance url (bb2--data-get 'uploadUrl))
@@ -272,7 +272,8 @@
 (defun bb2-open-remote (file-id)
   "Download an org file from backblaze into a new buffer."
   (interactive
-   (let ((file-id (ask-for-id-by-name bb2-ctx)))
+   (let ((file-id (bb2-with-instance :main
+		    (ask-for-id-by-name bb2-instance))))
      (list file-id)))
   (bb2-with-instance :downloads
     (get-org-file-by-id bb2-instance file-id)))
