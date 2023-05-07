@@ -404,6 +404,4 @@ Optional argument CONTENT-TYPE is the HTTP content-type header value."
 
 (provide 'org-bb2)
 
-(provide 'org-bb2)
-
 ;;; org-bb2.el ends here
