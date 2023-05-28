@@ -1,6 +1,8 @@
-# org-bb2
-Sync org files with backblaze B2.
+# bb2
+Sync files with backblaze B2.
 
 Requires
 - `dash`
-- `fatch` (shameless self promotion)
+- `assoak` (shameless self promotion)
+- `request`
+- `promise`
