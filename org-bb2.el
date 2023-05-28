@@ -6,6 +6,7 @@
 
 (require 'dash)
 (require 'request)
+(require 'promise)
 (require 'assoak)
 
 ;; To set up:
@@ -30,6 +31,8 @@
   "Account's bucket ids.")
 (defvar bb2-bucket-id ""
   "The current bucket.")
+(defvar bb2--upload-details nil
+  "Details for uploading. (cons BUFFER CONTENT-TYPE")
 
 (defun bb2--with-current-ctx (ctx &rest args)
   (if (= (length args) 1)
@@ -99,9 +102,6 @@ Optional argument BODY are the form(s) evaluated."
 ;; - url: hard coded, unique to Auth
 ;; - authenticate(): set the Basic ctx
 ;;   - sets global Basic ctx
-(defun bb2--data-get (key)
-  (alist-get key (bb2-response :data)))
-
 (defun bb2--pre-auth-headers ()
   `(("Authorization" . ,(format
 			 "Basic %s"
@@ -211,17 +211,13 @@ Argument CTX is the current `bb2-instance'."
 		it)
 	 (alist-get 'fileName it))))
 
-(cl-defmethod set-file-names ((ctx bb2--ctx-basic))
-  (ctx-fetch
+(cl-defmethod set-file-names-P ((ctx bb2--ctx-basic))
+  (ctx-fetch-P
    ctx
    'list-file-names
    :meta ctx
    :type "POST"
    :data (json-encode `((bucketId . ,bb2-bucket-id)))
-   :complete (bb2--with-response
-	      (oset (bb2-response :meta)
-		    files
-		    (bb2-response :data)))
    :parser 'json-read))
 
 (cl-defmethod post-file-names-P ((ctx bb2--ctx-basic))
@@ -232,20 +228,20 @@ Argument CTX is the current `bb2-instance'."
    :parser 'json-read
    :data (json-encode `((bucketId . ,bb2-bucket-id)))))
 
-(cl-defmethod set-upload-config ((ctx bb2--ctx-basic))
-  (ctx-fetch
-   ctx
-   'get-upload-url
-   :meta ctx
-   :type "POST"
-   :data (json-encode `((bucketId . ,bb2-bucket-id)))
-   :headers (auth-headers ctx)
-   :ctx (list :self ctx)
-   :complete (bb2--with-response
-	      (bb2-with-instance :uploads
-		(oset bb2-instance url (bb2--data-get 'uploadUrl))
-		(oset bb2-instance token (bb2--data-get 'authorizationToken))))
-   :parser 'json-read))
+(cl-defmethod set-upload-config-P ((ctx bb2--ctx-basic))
+  (condition-case no-token
+      (promise-new
+       (lambda (resolve _)
+	 (funcall resolve (oref (bb2-ctxs :uploads) token))))
+    (unbound-slot
+     (ctx-fetch-P
+      ctx
+      'get-upload-url
+      :meta ctx
+      :type "POST"
+      :data (json-encode `((bucketId . ,bb2-bucket-id)))
+      :headers (auth-headers ctx)
+      :parser 'json-read))))
 
 ;; Downloading
 ;; - token: shared w/ normal reqs
@@ -287,88 +283,70 @@ Argument CTX is the current `bb2-instance'."
 	      :documentation "Recommended upload chunk size (bytes)."))
   "API context for upload operations.")
 
-(cl-defmethod upload-org-file ((ctx bb2--ctx-upload)
-			       file-name
-			       contents
-			       &optional content-type)
-  (let ((-url (oref ctx url)))
-    (bb2-response :method "POST" :url -url)
-    (request
-      -url
-      :meta ctx
-      :type "POST"
-      :headers (auth-headers
-		ctx
-		`((Content-Type . ,(or content-type "text/plain"))
-		  (X-Bz-Content-Sha1 . ,(secure-hash 'sha1 contents))
-		  (X-Bz-File-Name . ,file-name)
-		  (X-Bz-Info-Author . ,(user-login-name))
-		  (X-Bz-Server-Side-Encryption . AES256)))
-      :data contents
-      :complete (bb2--with-response
-		 (pp (bb2-response :data)))
-      :parser 'json-read)))
+(cl-defmethod upload-org-file-P ((ctx bb2--ctx-upload)
+				 file-name
+				 contents
+				 &optional content-type)
+  (promise:request-with-args
+      (oref ctx url)
+    (list
+     :type "POST"
+     :headers (auth-headers
+	       ctx
+	       `((Content-Type . ,(or content-type "text/plain"))
+		 (X-Bz-Content-Sha1 . ,(secure-hash 'sha1 contents))
+		 (X-Bz-File-Name . ,file-name)
+		 (X-Bz-Info-Author . ,(user-login-name))
+		 (X-Bz-Server-Side-Encryption . AES256)))
+     :data contents
+     :parser 'json-read)))
 
-(defun bb2--auth-init ()
-  (bb2-ctxs
-   :main (bb2--ctx-basic
-	  :url (bb2--data-get 'apiUrl)
-	  :token (bb2--data-get 'authorizationToken))
-   :downloads (bb2--ctx-download
-	       :url (bb2--data-get 'downloadUrl)
-	       :token (bb2--data-get 'authorizationToken))
-   :uploads (bb2--ctx-upload
-	     :part-size (bb2--data-get
-			 'recommendedPartSize))))
-
+(defun bb2--auth-init (auth-res)
+  (let-alist auth-res
+    (bb2-ctxs
+     :main (bb2--ctx-basic
+	    :url .apiUrl
+	    :token .authorizationToken)
+     :downloads (bb2--ctx-download
+		 :url .downloadUrl
+		 :token .authorizationToken)
+     :uploads (bb2--ctx-upload
+	       :part-size .recommendedPartSize))))
+  
 (defun bb2-authenticate-P ()
   (let ((-url "https://api.backblazeb2.com/b2api/v2/b2_authorize_account"))
     (bb2-response :method "GET"
 		  :url -url)
-    (promise-chain
-	(promise:request-with-args
-	    -url
-	  (list :headers (bb2--pre-auth-headers)
-		:type "GET"
-		:parser 'json-read))
-      (then (lambda (res)
-	      (bb2-response :data res)
-	      (bb2--auth-init)
-	      (promise-resolve res))))))
+    (promise:request-with-args
+	-url
+      (list :headers (bb2--pre-auth-headers)
+	    :type "GET"
+	    :parser 'json-read))))
 
 ;;;; Interactions
-(defun bb2-authenticate ()
-  "Authenticate the current session."
-  (Interactive)
-  (Let ((-Url "Https://api.backblazeb2.com/b2api/v2/b2_authorize_account"))
-    (bb2-response :method "GET"
-		  :url -url)
-    (request
-      -url
-      :type "GET"
-      :headers (bb2--pre-auth-headers)
-      :complete (bb2--with-response
-		  (bb2--auth-init))
-      :parser 'json-read)))
-
-(defun bb2-choose-bucket (bucket-config)
-   "Set the current bucket.
-Argument BUCKET-CONFIG is an alist representing a bucket config."
-  (interactive
-   (let ((bucket-name (ivy-completing-read "Choose a bucket: "
+(defun bb2-login (bucket-config)
+  "Login with the current BUCKET-CONFIG."
+   (interactive
+    (let ((bucket-name (ivy-completing-read "Choose a bucket: "
 					 (seq-map 'car bb2-buckets))))
-     (list (assoc-default bucket-name bb2-buckets))))
-  (let-alist (car bucket-config)
+      (list (assoc-default bucket-name bb2-buckets))))
+   (let-alist (car bucket-config)
     (setq bb2-bucket-id .id
 	  bb2-api-key-id .key-id
 	  bb2-api-key-value .key-val)
-    (message "[bb2] Set bucket.")))
-
-(defun bb2-ls ()
-  "Retrieves files from the current BB2-BUCKET-ID."
-  (interactive)
-  (bb2-with-instance :main
-    (set-file-names bb2-instance)))
+    (message "[bb2] Set bucket."))
+   (promise-chain
+       (bb2-authenticate-P)
+     (then (lambda (res)
+	     (bb2--auth-init res)
+	     (message "[bb2] Retrieved auth response.")))
+     (then (bb2-lambda :main (auth-res)
+	     (set-file-names-P bb2-instance)))
+     (then (bb2-lambda :main (file-name-res)
+	     (oset bb2-instance files file-name-res)
+	     (message "[bb2] Retrieved bucket file information.")))
+     (catch (lambda (reason)
+	      (message "[bb2:err] %s" reason)))))
 
 (defun bb2-open-remote (file-id)
   "Download an org file from backblaze into a new buffer.
@@ -380,12 +358,6 @@ Argument FILE-ID is the unique id for a bb2 file."
   (bb2-with-instance :downloads
     (get-file-by-id bb2-instance file-id)))
 
-(defun bb2-config-uploads ()
-  "Fetches the configuration for uploading."
-  (interactive)
-  (bb2-with-instance :main
-    (set-upload-config bb2-instance)))
-
 (defun bb2-save-remote (buf &optional content-type)
   "Upload the current org buffer BUF to backblaze.
 The buffer's name becomes
@@ -395,12 +367,35 @@ Optional argument CONTENT-TYPE is the HTTP content-type header value."
    (let ((buf (current-buffer))
 	 (content-type (read-string "Content-type? (defaults to text/plain) ")))
      (list buf content-type)))
-  (bb2-with-instance :uploads
-    (upload-org-file bb2-instance
-		     (buffer-name buf)
-		     (buffer-substring-no-properties (point-min)
-						     (point-max))
-		     (if (string= "" content-type) nil content-type))))
+  (setq bb2--upload-details (cons buf content-type))
+  (promise-chain
+      (bb2-with-instance :main
+	(set-upload-config-P bb2-instance))
+    (then (bb2-lambda :uploads (upload-res-or-token)
+	    (if (stringp upload-res-or-token)
+		(message "[bb2] Found file upload configuration.")
+	      (message "[bb2] Retrieved file upload configuration.")
+	      (let-alist upload-res-or-token
+		(oset bb2-instance url .uploadUrl)
+		(oset bb2-instance token .authorizationToken)))))
+    (then (bb2-lambda :uploads (_)
+	    (with-current-buffer (car bb2--upload-details)
+	      (message "[bb2] Prepping to upload '%s'."
+		       (buffer-name (current-buffer)))
+	      (upload-org-file-P bb2-instance
+				 (buffer-name (current-buffer))
+				 (buffer-substring-no-properties (point-min)
+								 (point-max))
+				 (if (string= "" (cdr bb2--upload-details))
+				     nil
+				   (cdr bb2--upload-details))))))
+    (then (lambda (file-upload-res)
+	    (let-alist file-upload-res
+	      (message "[bb2] File '%s' uploaded at %s."
+		       .fileName
+		       .uploadTimestamp))))
+    (catch (lambda (reason)
+	     (message "[bb2:err] File uploaded error - %s" reason)))))
 
 (provide 'org-bb2)
 
