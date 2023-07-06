@@ -1,0 +1,34 @@
+* bb2
+Sync files with backblaze B2.
+
+** Requirements
++ ~dash.el~
++ ~assoak.el~ (shameless self promo)
++ ~request.el~
++ ~promise~
+
+** Installation
+#+BEGIN_SRC sh
+  git clone ...
+#+END_SRC
+
+#+BEGIN_SRC emacs-lisp
+  (use-package org-bb2
+    :ensure nil
+    :load-path "~/path/to/org-bb2"
+    :config
+    (setq bb2-buckets
+	  '(("<bucket-name>" ((id . "<bucket-id>")
+			      (key-id . "<secret-id>")
+			      (key-val . "<secret-val>"))))))
+#+END_SRC
+
+** Usage
+~bb2-login~
++ Log in to the selected bucket from ~bb2-buckets~.
+
+~bb2-open-remote~
++ Open the selected bucket file.
+
+~bb2-save-remote~
++ Save the current buffer to a bucket using. The buffer-name becomes the remote file-name.
