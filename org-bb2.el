@@ -230,10 +230,10 @@ Argument CTX is the current `bb2-instance'."
 
 (cl-defmethod set-upload-config-P ((ctx bb2--ctx-basic))
   (condition-case no-token
-      (promise-new
-       (lambda (resolve _)
-	 (funcall resolve (oref (bb2-ctxs :uploads) token))))
+      (promise-resolve
+       (oref (bb2-ctxs :uploads) token))
     (unbound-slot
+     (message "[bb2] No upload token found, retrieving.")
      (ctx-fetch-P
       ctx
       'get-upload-url
