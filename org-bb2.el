@@ -98,6 +98,15 @@ Optional argument BODY are the form(s) evaluated."
      (bb2-with-instance ,instance-name
        ,@body)))
 
+(defun bb2--args-to-params (args)
+  "Converts the plist ARGS to an alist of ((<string> . <string>)),
+stripping the leading ":" from each property name."
+  (--> (assoak-plist-to-alist args)
+       (-map (lambda (pair)
+	       (cons (substring (symbol-name (car pair)) 1)
+		     (cdr pair)))
+	     it)))
+  
 ;; Auth
 ;; - url: hard coded, unique to Auth
 ;; - authenticate(): set the Basic ctx
@@ -220,14 +229,6 @@ Argument CTX is the current `bb2-instance'."
    :data (json-encode `((bucketId . ,bb2-bucket-id)))
    :parser 'json-read))
 
-(cl-defmethod post-file-names-P ((ctx bb2--ctx-basic))
-  (ctx-fetch-P
-   ctx
-   'list-file-names
-   :headers '(("Content-Type" . "application/x-www-form-urlencoded"))
-   :parser 'json-read
-   :data (json-encode `((bucketId . ,bb2-bucket-id)))))
-
 (cl-defmethod set-upload-config-P ((ctx bb2--ctx-basic))
   (condition-case no-token
       (promise-resolve
@@ -242,6 +243,41 @@ Argument CTX is the current `bb2-instance'."
       :data (json-encode `((bucketId . ,bb2-bucket-id)))
       :headers (auth-headers ctx)
       :parser 'json-read))))
+
+(cl-defmethod list-file-versions-P ((ctx bb2--ctx-basic) &rest args)
+  "Fetches all file verions within a bucket.
+Argument CTX is the current `bb2-instance'.
+Optional ARGS:
+  :startFileId string
+  :startFileName string
+  :maxFileCount integer (defaults to 100, limit is 1000)
+  :prefix string (limit returned versions to given prefix)
+  :delimiter string (used to split file names into folders)"
+  (ctx-fetch-P
+   ctx
+   'list-file-versions
+   :type "GET"
+   :parser 'json-read
+   :headers (auth-headers ctx)
+   :params (cons (cons "bucketId" bb2-bucket-id)
+		 (bb2--args-to-params args))))
+
+(cl-defmethod delete-file-version-P ((ctx bb2--ctx-basic)
+				     fileId
+				     fileName
+				     &optional bypassGovernance)
+  "Deletes a file version with the given FILEID and FILENAME in the current
+CTX. BYPASSGOVERNANCE overrides the Object Lock."
+  (ctx-fetch-P
+   ctx
+   'delete-file-version
+   :type "POST"
+   :parser 'json-read
+   :headers (auth-headers ctx)
+   :data (json-encode `((fileName . ,fileName)
+			(fileId . ,fileId)
+			(bypassGovernance . ,bypassGovernance)))))
+
 
 ;; Downloading
 ;; - token: shared w/ normal reqs
